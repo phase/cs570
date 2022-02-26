@@ -4,12 +4,14 @@
 #
 import os.path
 import random
+import time
 import urllib.request
 
 import numpy as np
 import pandas
 import pandas as pd
 import plotnine as p9
+import sklearn
 from numpy import ndarray, isnan
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import GridSearchCV
@@ -140,7 +142,7 @@ class MyLogReg:
 
 # multi-layer perceptron
 class MyMLP:
-    def __init__(self, max_epochs, units_per_layer, batch_size=50, step_size=0.01):
+    def __init__(self, max_epochs, units_per_layer, batch_size=500, step_size=0.01):
         self.max_epochs = max_epochs
         self.batch_size = batch_size
         self.step_size = step_size
@@ -218,7 +220,7 @@ class MyMLP:
 
 # start the main part of HW 3
 class MyCV:
-    def __init__(self, estimator=MyKNN(), param_grid={'n_neighbors': [x for x in range(1, 10)]}, cv=5):
+    def __init__(self, estimator=MyKNN(), param_grid={'n_neighbors': [x for x in range(1, 10)]}, cv=4):
         self.fit_results = None
         self.best_params_ = None
         self.cv = cv
@@ -237,7 +239,6 @@ class MyCV:
             for param_key, param_values in self.param_grid.items():
                 for param_value in param_values:
                     setattr(self.estimator, param_key, param_value)
-                    print(param_key, getattr(self.estimator, param_key))
 
                     # split features & labels into subtrain & validation
                     subtrain_features = train_features[subtrain_indices]
@@ -249,11 +250,14 @@ class MyCV:
                     self.estimator.fit(subtrain_features, subtrain_labels)
                     estimated_validated_labels = self.estimator.predict(validation_features)
                     accuracy = (estimated_validated_labels == validation_labels).mean() * 100
-                    log_loss = np.log(1 + np.exp(-estimated_validated_labels * validation_labels))
+                    # log_loss = np.log(1 + np.exp(np.matmul(-estimated_validated_labels, validation_labels)))
+                    log_loss = sklearn.metrics.log_loss(validation_labels, estimated_validated_labels)
+                    print(param_key, getattr(self.estimator, param_key),
+                          "Accuracy:", accuracy, "Log Loss:", log_loss)
                     fit_results[str(train_fold_id) + param_key + str(param_value)] = {
                         param_key: getattr(self.estimator, param_key),
                         "accuracy": accuracy,
-                        "loss": log_loss.mean()
+                        "loss": log_loss
                     }
         # get the best results by max on the accuracy of the results
         self.fit_results = fit_results
@@ -278,6 +282,9 @@ class InitialNode:
     def __init__(self, value):
         self.value = value
 
+    def backward(self):
+        pass
+
 
 # node in the computation graph which is computed using other nodes
 class Operation(InitialNode):
@@ -286,6 +293,8 @@ class Operation(InitialNode):
             setattr(self, input_name, node)
         self.nodes = nodes
         self.value = self.forward()
+        if self.value is None:
+            print("Error: value is None")
         self.grad = None
         super().__init__(self.value)
 
@@ -307,7 +316,7 @@ class mm(Operation):
     input_names = ("features", "weights")
 
     def forward(self):
-        self.value = np.matmul(self.features.value, self.weights.value)
+        return np.matmul(self.features.value, self.weights.value)
 
     def gradient(self):
         return (
@@ -321,20 +330,28 @@ class relu(Operation):
     input_names = ("a",)
 
     def forward(self):
-        pass
+        return np.where(self.a.value > 0, self.a.value, 0)
+
+    def gradient(self):
+        x = np.where(self.a.value > 0, self.grad, 0)
+        return (x.reshape(self.a.value.shape),)
 
 
 class logistic_loss(Operation):
     input_names = ("predictions", "labels")
 
     def forward(self):
-        self.value = np.log(1 + np.exp(-self.predictions.value * self.labels.value))
+        x = np.matmul(-self.labels.value, self.predictions.value)
+        return np.log(1 + np.exp(x))
 
     def gradient(self):
-        return -self.labels.value / (1 + np.exp(self.predictions.value * self.labels.value))
+        g = np.array(-self.labels.value / (1 + np.exp(np.matmul(self.labels.value, self.predictions.value))))
+        g = g.reshape(g.shape[0], 1)
+        return (g, g)
+
 
 class AutoMLP:
-    def __init__(self, max_epochs, units_per_layer, batch_size=50, step_size=0.01):
+    def __init__(self, max_epochs, units_per_layer, batch_size=20, step_size=0.01):
         self.max_epochs = max_epochs
         self.batch_size = batch_size
         self.step_size = step_size
@@ -346,14 +363,22 @@ class AutoMLP:
         self.weight_mat_list = []
         # initialize with random weights near 0
         for layer_i in range(1, len(self.units_per_layer)):
-            w_size = self.units_per_layer[layer_i], self.units_per_layer[layer_i - 1]
-            self.weight_mat_list.append(np.random.normal(size=w_size))
+            w_size = self.units_per_layer[layer_i - 1], self.units_per_layer[layer_i]
+            self.weight_mat_list.append(InitialNode(np.random.normal(size=w_size, scale=0.175)))
 
     def take_step(self, X, y):
         x_node = InitialNode(X)
         y_node = InitialNode(y)
-        for layer in self.units_per_layer:
-            pass
+        h_list = [x_node]
+        for layer_i in range(1, len(self.units_per_layer)):
+            pred_node = mm(h_list[layer_i - 1], self.weight_mat_list[layer_i - 1])
+            h_node = relu(pred_node)
+            h_list.append(h_node)
+        loss_node = logistic_loss(h_list[-1], y_node)
+        loss_node.backward()
+        for layer_i in range(1, len(self.units_per_layer)):
+            weight = self.weight_mat_list[layer_i - 1]
+            weight.value -= self.step_size * weight.grad
 
     def fit(self, X, y):
         self.reset_weights()
@@ -367,133 +392,215 @@ class AutoMLP:
             for i in range(0, len(X), self.batch_size):
                 # get the random batch
                 batch_indices = indx[i:i + self.batch_size]
+                #print("  batch_indices", batch_indices)
                 batch_X = X[batch_indices]
                 batch_y = y.iloc[batch_indices]
-                grad_w = None  # TODO: compute gradient
-                for j in range(len(self.weight_mat_list)):
-                    self.weight_mat_list[j] -= self.step_size * grad_w[j]
+                self.take_step(batch_X, batch_y)
 
     def decision_function(self, X):
         values = X
         for weights in self.weight_mat_list:
-            values = np.matmul(values, weights.T)
+            values = np.matmul(values, weights.value)
         return np.concatenate(values)
 
     def predict(self, X):
         return np.where(self.decision_function(X) > 0, 1, 0)
 
-
-test_acc_df_list = []
-epoch_loss = []
-for data_set, (input_data, output_labels) in data_dict.items():
-    print(data_set, type(input_data), type(output_labels))
-    # split the data set into K training sets
-    k_fold_split = KFold(n_splits=3, shuffle=True, random_state=1).split(input_data)
-    for fold_id, indices in enumerate(k_fold_split):
-        mapped_data = {}
-        for name, split_indices in zip(["train", "test"], indices):
-            mapped_data[name] = {
-                "X": input_data[split_indices],
-                "y": output_labels.iloc[split_indices]
-            }
-
-        # HW 4
-        # my_logreg = MyCV(MyLogReg(max_iterations=10), param_grid={'max_iterations': [x for x in [1, 10, 100, 1000]]})
-        # my_logreg.fit(**mapped_data["train"])
-
-        # HW 5
-        print("Running MLP")
-        train_data = mapped_data["train"]["X"]
+# Full Runs
+def full_run():
+    epoch_mins = []
+    epoch_means = []
+    for data_set, data in data_dict.items():
+        # HW 6
+        time_start = time.time()
+        print("Running AutoMLP...")
+        train_data = data[0]
         mlp_layers = [train_data.shape[1], 10, 1]
-        max_epochs = [50, 500, 1000, 2500, 5000, 7500, 10000, 15000, 20000]
-        mlp_cv = MyCV(MyMLP(max_epochs=10, units_per_layer=mlp_layers), param_grid={'max_epochs': max_epochs})
-        my_mlp = make_pipeline(StandardScaler(), mlp_cv)
-        # my_mlp = MyMLP(max_epochs=500, units_per_layer=mlp_layers)
-        my_mlp.fit(**mapped_data["train"])
+        step_size = 0.1
+        batch_size = 5
+        if data_set == "spam":
+            print(train_data.shape)
+            mlp_layers = [train_data.shape[1], 5, 1]
+            step_size = 0.005
+            batch_size = 10
+        # good max_epochs = [50, 100, 250, 400, 500, 600, 750, 900, 1000]
+        max_epochs = [10, 50, 100, 200]
+        #max_epochs = [200, 400, 600, 800, 1000, 2000, 3000]
+        batch_sizes = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
+        step_sizes = [0.001, 0.01, 0.1, 0.5, 1, 2, 5, 10, 20, 50]
+        mlp = AutoMLP(max_epochs=250, units_per_layer=mlp_layers, batch_size=batch_size, step_size=step_size)
+        automlp_cv = MyCV(mlp, cv=6, param_grid={'max_epochs': max_epochs})
+        auto_mlp = make_pipeline(StandardScaler(), automlp_cv)
+        auto_mlp.fit(data[0], data[1])
         # record loss
-        for _, value in mlp_cv.fit_results.items():
+        epoch_loss = []
+        for _, value in automlp_cv.fit_results.items():
             epoch_loss.append(pd.DataFrame({
                 "max_epochs": value["max_epochs"],
                 "data_set": data_set,
                 "accuracy": value["accuracy"],
                 "loss": value["loss"]
             }, index=[0]))
-        print(mlp_cv.best_params_)
-        print("Done running MLP")
+        epoch_loss_min = pd.concat(epoch_loss).groupby('max_epochs', as_index=False).min()
+        epoch_loss_min['data_set'] = data_set
+        epoch_loss_mean = pd.concat(epoch_loss).groupby('max_epochs', as_index=False).mean()
+        epoch_loss_mean['data_set'] = data_set
+        print(epoch_loss_min)
+        print(epoch_loss_mean)
+        epoch_mins.append(epoch_loss_min)
+        epoch_means.append(epoch_loss_mean)
 
-        # setup grid search with training data
-        nearest_neighbor = GridSearchCV(KNeighborsClassifier(), {
-            'n_neighbors': [x for x in range(1, 21)]
-        })
-        nearest_neighbor.fit(**mapped_data["train"])
-        # scaled version
-        nearest_neighbor_scaled = make_pipeline(StandardScaler(), GridSearchCV(KNeighborsClassifier(), {
-            'n_neighbors': [x for x in range(1, 21)]
-        }))
-        nearest_neighbor_scaled.fit(**mapped_data["train"])
+        print(automlp_cv.best_params_)
+        print(automlp_cv.fit_results)
+        time_taken = time.time() - time_start
+        print("Done running AutoMLP in", time_taken, "seconds.")
 
-        # print("best params for train: ", nearest_neighbor.best_params_)
-        results = pd.DataFrame(nearest_neighbor.cv_results_)
+    epoch_mins_df = pd.concat(epoch_mins)
+    epoch_means_df = pd.concat(epoch_means)
+    gg = p9.ggplot() + \
+         p9.geom_line(
+             p9.aes(
+                 x="max_epochs",
+                 y="loss",
+             ),
+             data=epoch_mins_df) + \
+         p9.facet_grid(". ~ data_set")
+    gg.save("homework6_epoch_min_loss.png")
+    gg = p9.ggplot() + \
+         p9.geom_line(
+             p9.aes(
+                 x="max_epochs",
+                 y="loss",
+             ),
+             data=epoch_means_df) + \
+         p9.facet_grid(". ~ data_set")
+    gg.save("homework6_epoch_mean_loss.png")
+    return (epoch_mins_df, epoch_means_df)
 
-        # setup logistic regression with training data
-        pipe = make_pipeline(StandardScaler(), LogisticRegression(max_iter=100))
-        pipe.fit(**mapped_data["train"])
+# Experiments
+def experiments():
+    test_acc_df_list = []
+    for data_set, (input_data, output_labels) in data_dict.items():
+        print(data_set, type(input_data), type(output_labels))
+        # split the data set into K training sets
+        k_fold_split = KFold(n_splits=3, shuffle=True, random_state=1).split(input_data)
+        for fold_id, indices in enumerate(k_fold_split):
+            mapped_data = {}
+            for name, split_indices in zip(["train", "test"], indices):
+                mapped_data[name] = {
+                    "X": input_data[split_indices],
+                    "y": output_labels.iloc[split_indices]
+                }
 
-        # create featureless vec
-        # either all 0 or all 1 (whichever was more frequent in the train set labels)
-        train_set_labels = pd.DataFrame(mapped_data["train"]["y"])
-        # print("train_set_labels:", train_set_labels, "\ntrain_set_labels.mode: ", train_set_labels.mode())
-        mode = train_set_labels.mode().iloc[:, 0].values[0]
+            # HW 4
+            # my_logreg = MyCV(MyLogReg(max_iterations=10), param_grid={'max_iterations': [x for x in [1, 10, 100, 1000]]})
+            # my_logreg.fit(**mapped_data["train"])
 
-        # HW 3 defined classes
-        # my_knn = MyCV()
-        # my_knn.fit(**mapped_data["train"])s
+            # HW 6
+            time_start = time.time()
+            print("Running AutoMLP...")
+            train_data = mapped_data["train"]["X"]
+            mlp_layers = [train_data.shape[1], 10, 1]
+            step_size = 0.1
+            batch_size = 5
+            if data_set == "spam":
+                print(train_data.shape)
+                mlp_layers = [train_data.shape[1], 5, 1]
+                step_size = 0.005
+                batch_size = 10
+            # good max_epochs = [50, 100, 250, 400, 500, 600, 750, 900, 1000]
+            max_epochs = [10, 50, 100, 200, 400]
+            batch_sizes = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
+            step_sizes = [0.001, 0.01, 0.1, 0.5, 1, 2, 5, 10, 20, 50]
+            mlp = AutoMLP(max_epochs=250, units_per_layer=mlp_layers, batch_size=batch_size, step_size=step_size)
+            automlp_cv = MyCV(mlp, param_grid={'max_epochs': max_epochs})
+            auto_mlp = make_pipeline(StandardScaler(), automlp_cv)
+            auto_mlp.fit(**mapped_data["train"])
+            print(automlp_cv.best_params_)
+            print(automlp_cv.fit_results)
+            time_taken = time.time() - time_start
+            print("Done running AutoMLP in", time_taken, "seconds.")
 
-        # my_knn_scaled = make_pipeline(StandardScaler(), MyCV())
-        # my_knn_scaled.fit(**mapped_data["train"])
+            # # HW 5
+            time_start = time.time()
+            print("Running MyMLP...")
+            mlp = MyMLP(max_epochs=250, units_per_layer=mlp_layers, batch_size=batch_size, step_size=step_size)
+            mlp_cv = MyCV(mlp, param_grid={'max_epochs': max_epochs})
+            my_mlp = make_pipeline(StandardScaler(), mlp_cv)
+            # my_mlp = MyMLP(max_epochs=500, units_per_layer=mlp_layers)
+            my_mlp.fit(**mapped_data["train"])
+            print(mlp_cv.best_params_)
+            time_taken = time.time() - time_start
+            print("Done running MyMLP in", time_taken, "seconds.")
 
-        test_data = mapped_data["test"]["X"]
-        test_labels = mapped_data["test"]["y"]
-        pred_dict = {
-            "nearest_neighbors": nearest_neighbor.predict(test_data),
-            "nearest_neighbors_scaled": nearest_neighbor_scaled.predict(test_data),
-            # "my_nearest_neighbors": my_knn.predict(test_data),
-            # "my_nearest_neighbors_scaled": my_knn_scaled.predict(test_data),
-            # "my_logreg": my_logreg.predict(test_data),
-            "my_mlp": my_mlp.predict(test_data),
-            "logistic_regression": pipe.predict(test_data),
-            "featureless": np.repeat(mode, test_data.shape[0])
-        }
-        for algorithm, prediction in pred_dict.items():
-            test_acc_dict = {
-                "test_accuracy_percent": (prediction == test_labels).mean() * 100,
-                "data_set": data_set,
-                "fold_id": fold_id,
-                "algorithm": algorithm
+            # setup grid search with training data
+            nearest_neighbor = GridSearchCV(KNeighborsClassifier(), {
+                'n_neighbors': [x for x in range(1, 21)]
+            })
+            nearest_neighbor.fit(**mapped_data["train"])
+            # scaled version
+            nearest_neighbor_scaled = make_pipeline(StandardScaler(), GridSearchCV(KNeighborsClassifier(), {
+                'n_neighbors': [x for x in range(1, 21)]
+            }))
+            nearest_neighbor_scaled.fit(**mapped_data["train"])
+
+            # print("best params for train: ", nearest_neighbor.best_params_)
+            results = pd.DataFrame(nearest_neighbor.cv_results_)
+
+            # setup logistic regression with training data
+            pipe = make_pipeline(StandardScaler(), LogisticRegression(max_iter=100))
+            pipe.fit(**mapped_data["train"])
+
+            # create featureless vec
+            # either all 0 or all 1 (whichever was more frequent in the train set labels)
+            train_set_labels = pd.DataFrame(mapped_data["train"]["y"])
+            # print("train_set_labels:", train_set_labels, "\ntrain_set_labels.mode: ", train_set_labels.mode())
+            mode = train_set_labels.mode().iloc[:, 0].values[0]
+
+            # HW 3 defined classes
+            # my_knn = MyCV()
+            # my_knn.fit(**mapped_data["train"])s
+
+            # my_knn_scaled = make_pipeline(StandardScaler(), MyCV())
+            # my_knn_scaled.fit(**mapped_data["train"])
+
+            test_data = mapped_data["test"]["X"]
+            test_labels = mapped_data["test"]["y"]
+            pred_dict = {
+                "nearest_neighbors": nearest_neighbor.predict(test_data),
+                "nearest_neighbors_scaled": nearest_neighbor_scaled.predict(test_data),
+                # "my_nearest_neighbors": my_knn.predict(test_data),
+                # "my_nearest_neighbors_scaled": my_knn_scaled.predict(test_data),
+                # "my_logreg": my_logreg.predict(test_data),
+                "my_mlp": my_mlp.predict(test_data),
+                "auto_mlp": auto_mlp.predict(test_data),
+                "logistic_regression": pipe.predict(test_data),
+                "featureless": np.repeat(mode, test_data.shape[0])
             }
-            test_acc_df_list.append(pd.DataFrame(test_acc_dict, index=[0]))
+            for algorithm, prediction in pred_dict.items():
+                test_acc_dict = {
+                    "test_accuracy_percent": (prediction == test_labels).mean() * 100,
+                    "data_set": data_set,
+                    "fold_id": fold_id,
+                    "algorithm": algorithm
+                }
+                print(test_acc_dict)
+                test_acc_df_list.append(pd.DataFrame(test_acc_dict, index=[0]))
 
-test_acc_df = pd.concat(test_acc_df_list)
-epoch_loss_df = pd.concat(epoch_loss)
-print(test_acc_df)
+    test_acc_df = pd.concat(test_acc_df_list)
+    print(test_acc_df)
 
-# make a gg plot
-gg = p9.ggplot() + \
-     p9.geom_point(
-         p9.aes(
-             x="test_accuracy_percent",
-             y="algorithm",
-         ),
-         data=test_acc_df) + \
-     p9.facet_grid(". ~ data_set")
-gg.save("homework6.png")
+    # make a gg plot
+    gg = p9.ggplot() + \
+         p9.geom_point(
+             p9.aes(
+                 x="test_accuracy_percent",
+                 y="algorithm",
+             ),
+             data=test_acc_df) + \
+         p9.facet_grid(". ~ data_set")
+    gg.save("homework6.png")
 
-gg = p9.ggplot() + \
-     p9.geom_point(
-         p9.aes(
-             x="max_epochs",
-             y="loss",
-         ),
-         data=epoch_loss_df) + \
-     p9.facet_grid(". ~ data_set")
-gg.save("homework6_epoch_loss.png")
+
+full_run()
+experiments()
